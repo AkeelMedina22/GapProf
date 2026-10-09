@@ -1,0 +1,6 @@
+[submodule "submodules/llama.cpp"]
+	path = submodules/llama.cpp
+	url = https://github.com/ggerganov/llama.cpp.git
+[submodule "submodules/tracy"]
+	path = submodules/tracy
+	url = https://github.com/davidwed/tracy.git

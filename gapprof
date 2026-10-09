@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""
+gapprof: post-process the csv emitted by the c++ daemon into a per-phase
+energy report and a perfetto trace.
+"""
+
+import os
+import re
+import sys
+import json
+import argparse
+import subprocess
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+
+NEW_FMT    = re.compile(r'Phase_(Prefill|Decode) n=(\d+)$')
+LEGACY_FMT = re.compile(r'Phase_(Prefill|Decode)$')
+COUNTER_FMT = re.compile(r'Session Complete\. Total Energy:\s*(\d+)\s*mJ')
+
+class AdmissionError(Exception):
+    pass
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    default_csv = os.environ.get('GAPPROF_OUTPUT_CSV', 'gapprof_results.csv')
+    p.add_argument('--csv', default=default_csv)
+    p.add_argument('--skip-run', action='store_true',
+                   help='analyse an existing csv without launching a workload')
+    p.add_argument('--n-predict', type=int, default=None,
+                   help='generated tokens, needed for the admission gate and '
+                        'legacy relabelling (auto-detected from -n when running)')
+    p.add_argument('--n-seqs', type=int, default=1,
+                   help='lockstep sequences (1 for the single-sequence sweeps)')
+    p.add_argument('--counter-mj', type=int, default=None,
+                   help='nvml total-energy counter delta in mJ')
+    p.add_argument('target_args', nargs=argparse.REMAINDER)
+    return p.parse_args()
+
+
+def detect_n_predict(target):
+    """pull n_predict from the target command line (-n / --predict)."""
+    for i, tok in enumerate(target[:-1]):
+        if tok in ('-n', '--predict', '--n-predict'):
+            try:
+                return int(target[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def run_workload(args):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    lib_path = None
+    for candidate in (os.path.join(script_dir, 'build', 'libgapprof.so'),
+                      os.path.join(script_dir, '..', 'build', 'libgapprof.so')):
+        if os.path.exists(candidate):
+            lib_path = candidate
+            break
+    if lib_path is None:
+        sys.exit("[gapprof] libgapprof.so not found, build first")
+
+    target = args.target_args[1:] if args.target_args[:1] == ['--'] else args.target_args
+    if not target:
+        sys.exit("[gapprof] no target executable given (use -- <binary> <args>)")
+
+    if args.n_predict is None:
+        args.n_predict = detect_n_predict(target)
+
+    env = {**os.environ,
+           'CUDA_INJECTION64_PATH': lib_path,
+           'NVTX_INJECTION64_PATH': lib_path,
+           'LD_PRELOAD': lib_path,
+           'GAPPROF_OUTPUT_CSV': args.csv}
+
+    print(f"[gapprof] launching: {' '.join(target)}")
+    rc = subprocess.run(target, env=env).returncode
+    if rc != 0:
+        # a truncated trace from a crashed run looks analysable and is not
+        sys.exit(f"[gapprof] target exited with code {rc}, "
+                 f"run inadmissible, no report generated")
+
+
+def load_and_align(path):
+    """load csv and map gpu timestamps into host-clock space via SYNC points."""
+    if not os.path.exists(path):
+        sys.exit(f"[gapprof] {path} not found")
+    df = pd.read_csv(path, encoding_errors='replace')
+
+    sync = df[(df['Event_Source'] == 'SYNC') &
+              (df['GPU_Start_ns'] > 0) &
+              (df['Host_Timestamp_ns'] > 0)].copy()
+    sync = sync.sort_values('GPU_Start_ns').drop_duplicates(subset=['GPU_Start_ns'])
+    if len(sync) < 2:
+        sys.exit("[gapprof] need >=2 SYNC points for clock alignment")
+
+    gpu_to_host = interp1d(sync['GPU_Start_ns'].values,
+                           sync['Host_Timestamp_ns'].values,
+                           kind='linear', fill_value='extrapolate')
+
+    df['Aligned_Start_ns'] = np.nan
+    df['Aligned_End_ns'] = np.nan
+
+    nvml_mask = df['Event_Source'] == 'NVML'
+    df.loc[nvml_mask, 'Aligned_Start_ns'] = df.loc[nvml_mask, 'Host_Timestamp_ns']
+
+    gpu_mask = ~nvml_mask & (df['GPU_Start_ns'] > 0)
+    df.loc[gpu_mask, 'Aligned_Start_ns'] = gpu_to_host(df.loc[gpu_mask, 'GPU_Start_ns'].values)
+
+    has_end = df['Event_Source'].isin(['ACTIVITY_MEMCPY', 'ACTIVITY_KERNEL']) \
+              & (df['GPU_End_ns'] > 0)
+    df.loc[has_end, 'Aligned_End_ns'] = gpu_to_host(df.loc[has_end, 'GPU_End_ns'].values)
+
+    df = df.dropna(subset=['Aligned_Start_ns']).copy()
+    base = df['Aligned_Start_ns'].min()
+    df['T_us']        = (df['Aligned_Start_ns'] - base) / 1000.0
+    df['T_end_us']    = (df['Aligned_End_ns']   - base) / 1000.0
+    df['Duration_us'] = df['T_end_us'] - df['T_us']
+    return df
+
+
+def read_energy_counter_mj(csv_path):
+    """the daemon prints the nvml total-energy counter delta on teardown and
+    the harness redirects stdout to a sibling .log. the counter is never
+    written to the csv, so this is the only independent energy reading."""
+    log_path = csv_path.removesuffix('.csv') + '.log'
+    if not os.path.exists(log_path):
+        return None
+    value = None
+    with open(log_path, errors='replace') as f:
+        for line in f:
+            hit = COUNTER_FMT.search(line)
+            if hit:
+                value = int(hit.group(1))
+    return value
+
+
+def format_cross_validation(g):
+    if g['counter_residual_pct'] is None:
+        return "n/a (no NVML counter found, pass --counter-mj)"
+    return (f"{g['counter_residual_pct']:+.2f}% "
+            f"(full-trace integral {g['full_trace_J']:.1f} J "
+            f"vs NVML counter {g['counter_J']:.1f} J)")
+
+
+def build_energy_curve(df):
+    """trapezoidal integration of instantaneous power.
+    returns (interp_fn, nvml_df) where interp_fn(t_us) -> cumulative mJ."""
+    nvml = (df[df['Event_Source'] == 'NVML']
+              .drop_duplicates(subset=['T_us'])
+              .sort_values('T_us')).copy()
+    if len(nvml) < 2:
+        return None, nvml
+
+    t = nvml['T_us'].values
+    p = nvml['Power_mW_Instant'].values.astype(float)
+    # mW * us = nJ, /1e6 -> mJ
+    dE_mj = 0.5 * (p[:-1] + p[1:]) * np.diff(t) / 1e6
+    cum_mj = np.concatenate([[0.0], np.cumsum(dE_mj)])
+    nvml['Energy_mJ_integrated'] = cum_mj
+
+    interp = interp1d(t, cum_mj, kind='linear', bounds_error=False,
+                      fill_value=(0.0, float(cum_mj[-1])))
+    return interp, nvml
+
+
+def integrate_energy_j(interp, start_us, end_us):
+    if interp is None or end_us <= start_us:
+        return 0.0
+    return float(interp(end_us) - interp(start_us)) / 1000.0
+
+
+def reconstruct_nvtx_ranges(df):
+    """stack-pair nvtx push/pop into (name, start_us, end_us) ranges."""
+    nvtx = df[df['Event_Source'] == 'NVTX_CB'].sort_values('T_us').copy()
+    if nvtx.empty:
+        return []
+
+    ranges, stack = [], []
+    for _, row in nvtx.iterrows():
+        if row['Event_Type'] == 'START':
+            stack.append((float(row['T_us']), str(row['Event_Name'])))
+        elif row['Event_Type'] == 'END' and stack:
+            start_t, name = stack.pop()
+            end_t = float(row['T_us'])
+            if end_t >= start_t:
+                ranges.append({'name': name, 'start_us': start_t, 'end_us': end_t})
+    return ranges
+
+
+def classify_ranges(nvtx_ranges, n_predict, n_seqs):
+    """assign 'phase' to every llama_decode nvtx range.
+    returns (classified_ranges, format_str). raises AdmissionError."""
+    new_fmt = [r for r in nvtx_ranges if NEW_FMT.match(r['name'])]
+    legacy  = [r for r in nvtx_ranges if LEGACY_FMT.match(r['name'])]
+
+    if new_fmt and legacy:
+        raise AdmissionError('mixed marker formats in one run')
+    if new_fmt:
+        out, fmt = _classify_new(new_fmt, n_seqs), 'new'
+    elif legacy:
+        out, fmt = _classify_legacy(legacy, n_predict), 'legacy'
+    else:
+        raise AdmissionError(
+            'no recognised nvtx phase markers found '
+            '(expected "Phase_* n=<N>" or legacy "Phase_*")')
+
+    _count_gate(out, n_predict)
+    return out, fmt
+
+
+def _classify_new(ranges, n_seqs):
+    """new format: phase from token count. the c++ prefix is a second
+    opinion about the same range, a disagreement means the capture rule
+    or the analysis rule is wrong and must not pass silently."""
+    for r in ranges:
+        m = NEW_FMT.match(r['name'])
+        r['n_tokens'] = int(m.group(2))
+        r['phase'] = 'Prefill' if r['n_tokens'] > n_seqs else 'Decode'
+        if r['phase'] != m.group(1):
+            raise AdmissionError(
+                f"capture label {m.group(1)} disagrees with derived phase "
+                f"{r['phase']} for range '{r['name']}' at {r['start_us']:.0f} us")
+    return ranges
+
+
+def _classify_legacy(ranges, n_predict):
+    """legacy format: lockstep relabelling. the final n_predict
+    decode-labelled ranges are decode, all earlier ranges are prefill."""
+    if n_predict is None:
+        raise AdmissionError(
+            'legacy markers need --n-predict for relabelling '
+            '(kv-state heuristic mislabels prefill chunks as decode)')
+
+    decode_labelled = [r for r in ranges if LEGACY_FMT.match(r['name'])
+                       and r['name'] == 'Phase_Decode']
+    if len(decode_labelled) < n_predict:
+        raise AdmissionError(
+            f'{len(decode_labelled)} decode-labelled ranges, '
+            f'need at least n_predict={n_predict}')
+
+    cutoff = sorted(r['start_us'] for r in decode_labelled)[-n_predict]
+    for r in ranges:
+        r['phase'] = ('Decode' if r['name'] == 'Phase_Decode'
+                      and r['start_us'] >= cutoff else 'Prefill')
+
+    _duration_gate(ranges)
+    return ranges
+
+
+def _duration_gate(ranges):
+    """relabelling sanity check: prompt chunks and decode steps differ by
+    orders of magnitude, so a relabelled prefill chunk shorter than the
+    longest decode step means the lockstep assumption did not hold."""
+    dur = lambda r: r['end_us'] - r['start_us']
+    decode_max = max((dur(r) for r in ranges if r['phase'] == 'Decode'),
+                     default=0.0)
+    bad = [r for r in ranges
+           if r['phase'] == 'Prefill' and r['name'] == 'Phase_Decode'
+           and dur(r) < decode_max]
+    if bad:
+        raise AdmissionError(
+            f'{len(bad)} relabelled prefill ranges shorter than the longest '
+            f'decode step ({decode_max:.0f} us), relabelling unsafe')
+
+
+def _count_gate(ranges, n_predict):
+    """hard gate: decode call count must equal generated tokens."""
+    n_decode = sum(1 for r in ranges if r['phase'] == 'Decode')
+    if n_predict is None:
+        print(f"[gapprof] WARNING: n_predict unknown, admission gate skipped "
+              f"({n_decode} decode calls counted), pass --n-predict")
+        return
+    if n_decode != n_predict - 1:
+        raise AdmissionError(
+            f'decode calls ({n_decode}) != n_predict ({n_predict})')
+
+
+def compute_phase_regions(classified):
+    """collapse classified ranges into two coarse regions:
+        prefill: [first prefill push, first decode push)
+        decode:  [first decode push, last decode pop]
+    note: cuda graphs decouple host push/pop from device execution, so we
+    attribute by region rather than point-in-time."""
+    prefill = [r for r in classified if r['phase'] == 'Prefill']
+    decode  = [r for r in classified if r['phase'] == 'Decode']
+
+    out = {'n_decode_calls': len(decode)}
+
+    if decode:
+        out['decode_start_us'] = min(r['start_us'] for r in decode)
+        out['decode_end_us']   = max(r['end_us']   for r in decode)
+
+    if prefill:
+        out['prefill_start_us'] = min(r['start_us'] for r in prefill)
+        out['prefill_end_us'] = (out['decode_start_us']
+                                  if 'decode_start_us' in out
+                                  else max(r['end_us'] for r in prefill))
+    return out
+
+
+def gpu_busy_intervals(df):
+    """merge all kernel intervals into non-overlapping busy windows.
+    This does not include cudaMemcpy(Async), which is considered idle time"""
+    ops = df[df['Event_Source'].isin(['ACTIVITY_KERNEL'])]
+    if ops.empty:
+        return []
+    intervals = sorted(zip(ops['T_us'].values, ops['T_end_us'].values))
+    merged = []
+    cur_s, cur_e = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
+    return merged
+
+
+def stall_metrics(busy_intervals, region_start_us, region_end_us, energy_interp):
+    """within the given region, split wall time and energy into busy vs stall.
+    stall = region minus union of gpu-busy intervals. stall energy is the
+    energy gap."""
+    if region_end_us <= region_start_us:
+        return {'busy_s': 0, 'stall_s': 0, 'busy_J': 0, 'stall_J': 0}
+
+    busy_s = 0.0
+    busy_J = 0.0
+    for s, e in busy_intervals:
+        if e <= region_start_us or s >= region_end_us:
+            continue
+        os_, oe_ = max(s, region_start_us), min(e, region_end_us)
+        if oe_ > os_:
+            busy_s += (oe_ - os_) / 1e6
+            busy_J += integrate_energy_j(energy_interp, os_, oe_)
+
+    region_s = (region_end_us - region_start_us) / 1e6
+    region_J = integrate_energy_j(energy_interp, region_start_us, region_end_us)
+    stall_s = max(region_s - busy_s, 0.0)
+    stall_J = max(region_J - busy_J, 0.0)
+    return {'busy_s': busy_s, 'stall_s': stall_s,
+            'busy_J': busy_J, 'stall_J': stall_J}
+
+
+def write_report(metrics, output_path):
+    lines = []
+    bar = "=" * 78
+    lines += [bar, "GapProf -- Inference Energy Report".center(78), bar, ""]
+
+    g = metrics['global']
+    lines += [
+        "[1] GLOBAL",
+        f"  Wall time (measurement window): {g['wall_s']:.4f} s",
+        f"  Total energy (integrated):      {g['total_J']:.4f} J",
+        f"  Average power:                  {g['avg_W']:.2f} W",
+        f"  NVML samples:                   {g['n_nvml_samples']} "
+            f"(effective rate {g['nvml_rate_hz']:.1f} Hz)",
+        f"  Counter cross-validation:       {format_cross_validation(g)}",
+        f"  Phase markers:                  {g['marker_format']} format"
+            + (", legacy ranges relabelled" if g['marker_format'] == 'legacy'
+               else ""),
+        ""
+    ]
+
+    lines += [
+        "[2] PHASES",
+        f"  {'Region':<10} {'Duration (s)':>14} {'Energy (J)':>14} "
+            f"{'Avg Power (W)':>16} {'J/token':>12}",
+        "  " + "-" * 70
+    ]
+    for name in ('Prefill', 'Decode'):
+        if name not in metrics['phases']:
+            continue
+        p = metrics['phases'][name]
+        jpt = f"{p['j_per_token']:.4f}" if p.get('j_per_token') is not None else "n/a"
+        lines += [
+            f"  {name:<10} {p['duration_s']:>14.4f} {p['energy_J']:>14.4f} "
+            f"{p['avg_power_W']:>16.2f} {jpt:>12}"
+        ]
+    lines += [""]
+
+    lines += ["[3] ENERGY GAP (decode region only)"]
+    if 'Decode' in metrics['phases']:
+        d = metrics['phases']['Decode']
+        s = metrics['stall_decode']
+        lines += [
+            f"  GPU busy time:        {s['busy_s']:.4f} s "
+                f"({100*s['busy_s']/d['duration_s']:.1f}% of decode)",
+            f"  GPU stall time:       {s['stall_s']:.4f} s "
+                f"({100*s['stall_s']/d['duration_s']:.1f}% of decode)",
+            f"  Energy during busy:   {s['busy_J']:.4f} J",
+            f"  Energy during stall:  {s['stall_J']:.4f} J  <-- energy gap",
+            f"  Stall-power average:  "
+            f"{s['stall_J']/s['stall_s'] if s['stall_s'] > 0 else 0:.2f} W "
+            f"(power held during inactive GPU)",
+        ]
+    else:
+        lines += ["  (no decode region)"]
+    lines += [""]
+
+    lines += [
+        "[4] WORKLOAD",
+        f"  Decode invocations (llama_decode calls): {metrics['n_decode_calls']}",
+        f"  Tokens generated (used for J/token):     {metrics['n_tokens']}",
+        ""
+    ]
+
+    lines += [bar]
+    with open(output_path, 'w') as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[gapprof] report -> {output_path}")
+
+
+def write_perfetto(df, nvtx_ranges, output_path):
+    LANES = {1: "NVTX", 2: "Kernels", 3: "Memcpys", 4: "Power"}
+    events = [{"name": "thread_name", "ph": "M", "pid": 1, "tid": tid,
+               "args": {"name": name}} for tid, name in LANES.items()]
+
+    for r in nvtx_ranges:
+        # show the derived phase where we have one, raw name otherwise
+        label = r.get('phase', r['name'])
+        events.append({"name": label, "ph": "X",
+                       "ts": r['start_us'],
+                       "dur": max(0.001, r['end_us'] - r['start_us']),
+                       "pid": 1, "tid": 1,
+                       "args": {"raw": r['name']}})
+
+    kernels = df[df['Event_Source'] == 'ACTIVITY_KERNEL']
+    for _, row in kernels.iterrows():
+        if row['Duration_us'] > 0:
+            events.append({"name": str(row['Event_Name']), "ph": "X",
+                           "ts": float(row['T_us']),
+                           "dur": float(row['Duration_us']),
+                           "pid": 1, "tid": 2})
+
+    memcpys = df[df['Event_Source'] == 'ACTIVITY_MEMCPY']
+    for _, row in memcpys.iterrows():
+        if row['Duration_us'] > 0:
+            events.append({"name": str(row['Event_Name']), "ph": "X",
+                           "ts": float(row['T_us']),
+                           "dur": float(row['Duration_us']),
+                           "pid": 1, "tid": 3,
+                           "args": {"bytes": int(row['Bytes'])}})
+
+    nvml = df[df['Event_Source'] == 'NVML']
+    for _, row in nvml.iterrows():
+        events.append({"name": "Power (W)", "ph": "C",
+                       "ts": float(row['T_us']), "pid": 1, "tid": 4,
+                       "args": {"Watts": float(row['Power_mW_Instant']) / 1000.0}})
+
+    with open(output_path, 'w') as f:
+        json.dump({"traceEvents": events}, f)
+    print(f"[gapprof] perfetto trace -> {output_path}")
+
+
+def analyse(args):
+    df = load_and_align(args.csv)
+    print(f"[gapprof] loaded {len(df)} telemetry records")
+
+    energy_interp, nvml = build_energy_curve(df)
+    if energy_interp is None:
+        sys.exit("[gapprof] <2 NVML samples, cannot integrate energy")
+
+    nvtx_ranges = reconstruct_nvtx_ranges(df)
+    if not nvtx_ranges:
+        sys.exit("[gapprof] no NVTX ranges found in csv")
+
+    try:
+        classified, marker_format = classify_ranges(
+            nvtx_ranges, args.n_predict, args.n_seqs)
+    except AdmissionError as e:
+        sys.exit(f"[gapprof] ADMISSION FAILED: {e}")
+
+    # crop to the measurement window and rebuild the energy curve on it
+    win_start = min(r['start_us'] for r in classified)
+    win_end   = max(r['end_us']   for r in classified)
+    df = df[(df['T_us'] >= win_start) & (df['T_us'] <= win_end)].copy()
+    energy_interp, nvml = build_energy_curve(df)
+
+    full_trace_J = float(nvml['Energy_mJ_integrated'].iloc[-1]) / 1000.0
+
+    regions = compute_phase_regions(classified)
+    busy = gpu_busy_intervals(df)
+
+    dec = [r for r in classified if r['phase'] == 'Decode']
+    if dec:
+        lo = min(r['start_us'] for r in dec)
+        hi = max(r['end_us'] for r in dec)
+
+        host_ms = sum(r['end_us'] - r['start_us'] for r in dec) / 1e3
+        dev_s = sum(min(e, hi) - max(s, lo) for s, e in busy if e > lo and s < hi) / 1e6
+        print(f"[gapprof] host-side decode ranges {host_ms:.1f} ms, device kernel time {dev_s:.3f} s")
+        
+    n_tokens = regions.get('n_decode_calls', 0)
+
+    metrics = {'phases': {},
+               'n_decode_calls': regions.get('n_decode_calls', 0),
+               'n_tokens': n_tokens}
+
+    wall_s = (win_end - win_start) / 1e6
+    total_J = integrate_energy_j(energy_interp, win_start, win_end)
+    counter_mj = (args.counter_mj if args.counter_mj is not None
+                  else read_energy_counter_mj(args.csv))
+    counter_J = counter_mj / 1000.0 if counter_mj else None
+    counter_residual_pct = (100 * (full_trace_J - counter_J) / counter_J
+                            if counter_J else None)
+    metrics['global'] = {
+        'wall_s': wall_s,
+        'total_J': total_J,
+        'avg_W': total_J / wall_s if wall_s > 0 else 0,
+        'n_nvml_samples': len(nvml),
+        'nvml_rate_hz': len(nvml) / wall_s if wall_s > 0 else 0,
+        'counter_residual_pct': counter_residual_pct,
+        'marker_format': marker_format,
+        'full_trace_J': full_trace_J,
+        'counter_J': counter_J,
+        'counter_residual_pct': counter_residual_pct,
+    }
+
+    if 'prefill_start_us' in regions:
+        ps, pe = regions['prefill_start_us'], regions['prefill_end_us']
+        e_J = integrate_energy_j(energy_interp, ps, pe)
+        dur_s = (pe - ps) / 1e6
+        # note: j_per_token is None for prefill, prompt token count is not
+        # available here (read from llama-completion's "prompt eval time")
+        metrics['phases']['Prefill'] = {
+            'duration_s': dur_s, 'energy_J': e_J,
+            'avg_power_W': e_J / dur_s if dur_s > 0 else 0,
+            'j_per_token': None,
+        }
+
+    if 'decode_start_us' in regions:
+        ds, de = regions['decode_start_us'], regions['decode_end_us']
+        e_J = integrate_energy_j(energy_interp, ds, de)
+        dur_s = (de - ds) / 1e6
+        metrics['phases']['Decode'] = {
+            'duration_s': dur_s, 'energy_J': e_J,
+            'avg_power_W': e_J / dur_s if dur_s > 0 else 0,
+            'j_per_token': e_J / n_tokens if n_tokens > 0 else None,
+        }
+        metrics['stall_decode'] = stall_metrics(busy, ds, de, energy_interp)
+
+    prefix = args.csv.removesuffix('.csv')
+    write_report(metrics, f"{prefix}.rpt")
+    write_perfetto(df, classified + [r for r in nvtx_ranges
+                                     if 'phase' not in r], f"{prefix}.trace.json")
+
+def main():
+    args = parse_args()
+    if not args.skip_run:
+        run_workload(args)
+    analyse(args)
+
+
+if __name__ == '__main__':
+    main()
